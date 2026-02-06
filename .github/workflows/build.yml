@@ -1,0 +1,357 @@
+name: Build LuaJIT
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  check-updates:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.check.outputs.should_build }}
+      commit_sha: ${{ steps.check.outputs.commit_sha }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Check for upstream updates
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git clone --quiet https://luajit.org/git/luajit.git upstream
+          cd upstream
+          COMMIT_SHA=$(git rev-parse HEAD)
+          RELVER=$(git show -s --format=%ct HEAD)
+          VERSION="2.1.${RELVER}"
+          cd ..
+
+          echo "commit_sha=$COMMIT_SHA" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Manual trigger — forcing build"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          LAST_TAG=$(gh release view --json tagName -q .tagName 2>/dev/null || echo "")
+          if [ -z "$LAST_TAG" ]; then
+            echo "No previous release found — building"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          EXPECTED_TAG="v${VERSION}"
+          if [ "$EXPECTED_TAG" != "$LAST_TAG" ]; then
+            echo "Upstream changed ($LAST_TAG -> $EXPECTED_TAG) — building"
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No upstream changes — skipping"
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  validate:
+    needs: check-updates
+    if: needs.check-updates.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate outputs
+        run: |
+          TAG="v${{ needs.check-updates.outputs.version }}"
+          if ! echo "$TAG" | grep -qP '^v[0-9]+\.[0-9]+\.[0-9]+[a-z]?$'; then
+            echo "FAIL: tag '$TAG' does not match expected format"
+            exit 1
+          fi
+          COMMIT_SHA="${{ needs.check-updates.outputs.commit_sha }}"
+          if ! echo "$COMMIT_SHA" | grep -qP '^[0-9a-f]{40}$'; then
+            echo "FAIL: commit SHA is not valid"
+            exit 1
+          fi
+          echo "OK: tag='$TAG' commit='${COMMIT_SHA:0:8}...'"
+
+  build:
+    needs: [check-updates, validate]
+    if: needs.check-updates.outputs.should_build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-x64-static
+            os: ubuntu-latest
+            buildmode: static
+            artifacts: |
+              src/luajit
+              src/libluajit.a
+            archive: tar.gz
+
+          - name: linux-x64-dynamic
+            os: ubuntu-latest
+            buildmode: dynamic
+            artifacts: |
+              src/luajit
+              src/libluajit.so
+            archive: tar.gz
+
+          - name: windows-msvc-x64-static
+            os: windows-latest
+            buildmode: static
+            artifacts: |
+              src/luajit.exe
+              src/lua51.lib
+            archive: zip
+
+          - name: windows-msvc-x64-dynamic
+            os: windows-latest
+            buildmode: dynamic
+            artifacts: |
+              src/luajit.exe
+              src/lua51.dll
+              src/lua51.lib
+            archive: zip
+
+          - name: windows-mingw-x64-static
+            os: windows-latest
+            buildmode: static
+            artifacts: |
+              src/luajit.exe
+              src/libluajit.a
+            archive: zip
+
+          - name: windows-mingw-x64-dynamic
+            os: windows-latest
+            buildmode: dynamic
+            artifacts: |
+              src/luajit.exe
+              src/lua51.dll
+            archive: zip
+
+    runs-on: ${{ matrix.os }}
+    name: ${{ matrix.name }}
+    env:
+      VERSION: ${{ needs.check-updates.outputs.version }}
+      COMMIT_SHA: ${{ needs.check-updates.outputs.commit_sha }}
+
+    steps:
+      - name: Set up MSYS2
+        if: contains(matrix.name, 'mingw')
+        uses: msys2/setup-msys2@4f806de0a5a7294ffabaff804b38a9b435a73bda # v2.30.0
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc mingw-w64-ucrt-x86_64-make
+
+      - name: Set up MSVC
+        if: contains(matrix.name, 'msvc')
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+        with:
+          arch: x64
+
+      - name: Clone LuaJIT
+        shell: bash
+        run: |
+          git clone https://luajit.org/git/luajit.git luajit-src
+          cd luajit-src
+          git checkout ${{ needs.check-updates.outputs.commit_sha }}
+
+      - name: Build (Linux)
+        if: contains(matrix.name, 'linux')
+        working-directory: luajit-src/src
+        run: make -j$(nproc) BUILDMODE=${{ matrix.buildmode }} amalg
+
+      - name: Patch msvcbuild.bat for UCRT
+        if: contains(matrix.name, 'msvc')
+        working-directory: luajit-src/src
+        shell: pwsh
+        run: |
+          $f = 'msvcbuild.bat'
+          $c = Get-Content $f -Raw
+          # Add explicit /MD to all build paths (dynamic UCRT linkage for ffi.C)
+          $c = $c.Replace('%LJCOMPILE% ljamalg.c', '%LJCOMPILE% /MD ljamalg.c')
+          $c = $c.Replace('%LJCOMPILE% lj_*.c lib_*.c', '%LJCOMPILE% /MD lj_*.c lib_*.c')
+          $c = $c.Replace('%LJCOMPILE% luajit.c', '%LJCOMPILE% /MD luajit.c')
+          Set-Content $f $c -NoNewline
+
+      - name: Build (MSVC)
+        if: contains(matrix.name, 'msvc')
+        working-directory: luajit-src/src
+        shell: cmd
+        run: call msvcbuild amalg ${{ matrix.buildmode == 'static' && 'static' || '' }}
+
+      - name: Verify CRT linkage (MSVC)
+        if: contains(matrix.name, 'msvc')
+        working-directory: luajit-src/src
+        shell: pwsh
+        run: |
+          $bins = @('luajit.exe')
+          if (Test-Path 'lua51.dll') { $bins += 'lua51.dll' }
+          foreach ($bin in $bins) {
+            Write-Host "--- $bin ---"
+            $out = & dumpbin /dependents $bin 2>&1
+            $out | Select-String '\.dll' | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+            if ($out | Select-String 'msvcrt\.dll') {
+              Write-Host "FAIL: $bin depends on msvcrt.dll"
+              exit 1
+            }
+          }
+          Write-Host "PASS: no msvcrt.dll dependency"
+
+      - name: Verify UCRT linkage (MSVC static)
+        if: contains(matrix.name, 'msvc') && matrix.buildmode == 'static'
+        working-directory: luajit-src/src
+        shell: pwsh
+        run: |
+          $out = & dumpbin /dependents luajit.exe 2>&1
+          $out | Select-String '\.dll' | ForEach-Object { Write-Host "  $($_.Line.Trim())" }
+          if (-not ($out | Select-String 'api-ms-win-crt')) {
+            Write-Host "FAIL: static build does not link UCRT (ffi.C needs it)"
+            exit 1
+          }
+          Write-Host "PASS: static build links UCRT via api-ms-win-crt (required for ffi.C)"
+
+      - name: Build (MinGW)
+        if: contains(matrix.name, 'mingw')
+        working-directory: luajit-src/src
+        shell: msys2 {0}
+        run: mingw32-make -j$(nproc) BUILDMODE=${{ matrix.buildmode }} TARGET_XLIBS=-lucrt amalg
+
+      - name: Verify CRT linkage (MinGW)
+        if: contains(matrix.name, 'mingw')
+        working-directory: luajit-src/src
+        shell: msys2 {0}
+        run: |
+          for bin in luajit.exe $(ls lua51.dll 2>/dev/null); do
+            echo "--- $bin ---"
+            objdump -p "$bin" | grep "DLL Name"
+            if objdump -p "$bin" | grep -qi "DLL Name: msvcrt\.dll"; then
+              echo "FAIL: $bin depends on msvcrt.dll"
+              exit 1
+            fi
+            if ! objdump -p "$bin" | grep -qi "DLL Name: api-ms-win-crt"; then
+              echo "FAIL: $bin does not link UCRT"
+              exit 1
+            fi
+          done
+          echo "PASS: links UCRT via api-ms-win-crt, no msvcrt.dll dependency"
+
+      - name: Package (tar.gz)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          DIST="luajit-${VERSION}-${{ matrix.name }}"
+          mkdir -p "$DIST"/{bin,lib,include/luajit,share/luajit/jit}
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            case "$f" in
+              *luajit)    cp "luajit-src/$f" "$DIST/bin/" ;;
+              *libluajit*) cp "luajit-src/$f" "$DIST/lib/" ;;
+            esac
+          done <<< "${{ matrix.artifacts }}"
+
+          cp luajit-src/src/lua.h luajit-src/src/lualib.h \
+             luajit-src/src/lauxlib.h luajit-src/src/luaconf.h \
+             luajit-src/src/lua.hpp luajit-src/src/luajit.h \
+             "$DIST/include/luajit/"
+          cp luajit-src/src/jit/*.lua "$DIST/share/luajit/jit/"
+
+          tar czf "${DIST}.tar.gz" "$DIST"
+
+      - name: Package (zip)
+        if: matrix.archive == 'zip'
+        shell: bash
+        run: |
+          DIST="luajit-${VERSION}-${{ matrix.name }}"
+          mkdir -p "$DIST"/{bin,lib,include/luajit,share/luajit/jit}
+
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            f=$(echo "$f" | tr '\\' '/')
+            base=$(basename "$f")
+            case "$base" in
+              luajit.exe) cp "luajit-src/$f" "$DIST/bin/" ;;
+              lua51.dll)  cp "luajit-src/$f" "$DIST/bin/" ;;
+              lua51.lib)  cp "luajit-src/$f" "$DIST/lib/" ;;
+              libluajit*) cp "luajit-src/$f" "$DIST/lib/" ;;
+            esac
+          done <<< "${{ matrix.artifacts }}"
+
+          cp luajit-src/src/lua.h luajit-src/src/lualib.h \
+             luajit-src/src/lauxlib.h luajit-src/src/luaconf.h \
+             luajit-src/src/lua.hpp luajit-src/src/luajit.h \
+             "$DIST/include/luajit/"
+          cp luajit-src/src/jit/*.lua "$DIST/share/luajit/jit/"
+
+          7z a "${DIST}.zip" "$DIST"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.name }}
+          path: luajit-${{ env.VERSION }}-${{ matrix.name }}.${{ matrix.archive }}
+
+  release:
+    needs: [check-updates, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: read
+    env:
+      VERSION: ${{ needs.check-updates.outputs.version }}
+      COMMIT_SHA: ${{ needs.check-updates.outputs.commit_sha }}
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          path: artifacts
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v${VERSION}"
+          TITLE="LuaJIT ${VERSION}"
+          DATE=$(date -u +%Y-%m-%d)
+
+          BODY="## LuaJIT ${VERSION}
+
+          **Upstream commit:** \`${COMMIT_SHA}\`
+          **Build date:** ${DATE}
+
+          ### Archives
+
+          | Archive | Platform | Linkage |
+          |---------|----------|---------|
+          | \`luajit-${VERSION}-linux-x64-static.tar.gz\` | Linux x64 | Static |
+          | \`luajit-${VERSION}-linux-x64-dynamic.tar.gz\` | Linux x64 | Dynamic |
+          | \`luajit-${VERSION}-windows-msvc-x64-static.zip\` | Windows x64 (MSVC) | Static |
+          | \`luajit-${VERSION}-windows-msvc-x64-dynamic.zip\` | Windows x64 (MSVC) | Dynamic |
+          | \`luajit-${VERSION}-windows-mingw-x64-static.zip\` | Windows x64 (MinGW) | Static |
+          | \`luajit-${VERSION}-windows-mingw-x64-dynamic.zip\` | Windows x64 (MinGW) | Dynamic |
+
+          Each archive contains:
+          - LuaJIT binary
+          - Libraries (static or dynamic)
+          - Header files
+          - JIT library (\`jit/*.lua\`)
+
+          ### Runtime Dependencies
+
+          All Windows builds dynamically link the Universal CRT (UCRT).
+          This requires \`ucrtbase.dll\` and \`vcruntime140.dll\`, which are
+          included in Windows 10+ and the
+          [Visual C++ Redistributable](https://aka.ms/vs/17/release/vc_redist.x64.exe).
+
+          UCRT dynamic linkage is required so that LuaJIT's FFI (\`ffi.C\`)
+          can resolve C runtime symbols (e.g. \`_wstat64\`) at runtime."
+
+          gh release create "$TAG" \
+            --title "$TITLE" \
+            --notes "$BODY" \
+            artifacts/**/*
