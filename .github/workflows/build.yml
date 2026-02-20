@@ -261,6 +261,68 @@ jobs:
 
           tar czf "${DIST}.tar.gz" "$DIST"
 
+      - name: Package (.deb)
+        if: matrix.archive == 'tar.gz'
+        shell: bash
+        run: |
+          if [ "${{ matrix.buildmode }}" = "static" ]; then
+            PKG_NAME="luajit-static"
+            CONFLICTS="luajit"
+            DESC="LuaJIT ${VERSION} (statically linked)"
+          else
+            PKG_NAME="luajit"
+            CONFLICTS="luajit-static"
+            DESC="LuaJIT ${VERSION} (dynamically linked)"
+          fi
+
+          DEB="${PKG_NAME}_${VERSION}_amd64"
+          mkdir -p "${DEB}/DEBIAN"
+          mkdir -p "${DEB}/usr/bin"
+          mkdir -p "${DEB}/usr/lib"
+          mkdir -p "${DEB}/usr/include/luajit-2.1"
+          mkdir -p "${DEB}/usr/share/luajit-2.1/jit"
+
+          cp luajit-src/src/luajit "${DEB}/usr/bin/"
+
+          if [ "${{ matrix.buildmode }}" = "static" ]; then
+            cp luajit-src/src/libluajit.a "${DEB}/usr/lib/"
+          else
+            SONAME=$(readelf -d luajit-src/src/libluajit.so \
+              | sed -n 's/.*SONAME.*\[\(.*\)\]/\1/p')
+            cp luajit-src/src/libluajit.so "${DEB}/usr/lib/${SONAME}"
+            ln -s "${SONAME}" "${DEB}/usr/lib/libluajit-5.1.so"
+          fi
+
+          cp luajit-src/src/lua.h luajit-src/src/lualib.h \
+             luajit-src/src/lauxlib.h luajit-src/src/luaconf.h \
+             luajit-src/src/lua.hpp luajit-src/src/luajit.h \
+             "${DEB}/usr/include/luajit-2.1/"
+          cp luajit-src/src/jit/*.lua "${DEB}/usr/share/luajit-2.1/jit/"
+
+          if [ "${{ matrix.buildmode }}" = "dynamic" ]; then
+            printf 'activate-noawait ldconfig\n' > "${DEB}/DEBIAN/triggers"
+          fi
+
+          INSTALLED_SIZE=$(du -sk "${DEB}" | cut -f1)
+
+          cat > "${DEB}/DEBIAN/control" <<CTRL
+          Package: ${PKG_NAME}
+          Version: ${VERSION}
+          Architecture: amd64
+          Maintainer: LuaJIT CI <noreply@github.com>
+          Installed-Size: ${INSTALLED_SIZE}
+          Depends: libc6
+          Conflicts: ${CONFLICTS}
+          Replaces: ${CONFLICTS}
+          Section: interpreters
+          Priority: optional
+          Homepage: https://luajit.org
+          Description: ${DESC}
+          CTRL
+
+          dpkg-deb --build --root-owner-group "${DEB}"
+          mv "${DEB}.deb" "luajit-${VERSION}-${{ matrix.name }}.deb"
+
       - name: Package (zip)
         if: matrix.archive == 'zip'
         shell: bash
@@ -293,6 +355,13 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: luajit-${{ env.VERSION }}-${{ matrix.name }}.${{ matrix.archive }}
+
+      - name: Upload .deb artifact
+        if: matrix.archive == 'tar.gz'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: ${{ matrix.name }}-deb
+          path: luajit-${{ env.VERSION }}-${{ matrix.name }}.deb
 
   release:
     needs: [check-updates, build]
@@ -329,7 +398,9 @@ jobs:
           | Archive | Platform | Linkage |
           |---------|----------|---------|
           | \`luajit-${VERSION}-linux-x64-static.tar.gz\` | Linux x64 | Static |
+          | \`luajit-${VERSION}-linux-x64-static.deb\` | Linux x64 | Static |
           | \`luajit-${VERSION}-linux-x64-dynamic.tar.gz\` | Linux x64 | Dynamic |
+          | \`luajit-${VERSION}-linux-x64-dynamic.deb\` | Linux x64 | Dynamic |
           | \`luajit-${VERSION}-windows-msvc-x64-static.zip\` | Windows x64 (MSVC) | Static |
           | \`luajit-${VERSION}-windows-msvc-x64-dynamic.zip\` | Windows x64 (MSVC) | Dynamic |
           | \`luajit-${VERSION}-windows-mingw-x64-static.zip\` | Windows x64 (MinGW) | Static |
