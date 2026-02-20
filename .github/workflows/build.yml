@@ -388,6 +388,8 @@ jobs:
           TITLE="LuaJIT ${VERSION}"
           DATE=$(date -u +%Y-%m-%d)
 
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
+
           BODY="## LuaJIT ${VERSION}
 
           **Upstream commit:** \`${COMMIT_SHA}\`
