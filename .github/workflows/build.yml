@@ -355,6 +355,7 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: luajit-${{ env.VERSION }}-${{ matrix.name }}.${{ matrix.archive }}
+          retention-days: 1
 
       - name: Upload .deb artifact
         if: matrix.archive == 'tar.gz'
@@ -362,6 +363,7 @@ jobs:
         with:
           name: ${{ matrix.name }}-deb
           path: luajit-${{ env.VERSION }}-${{ matrix.name }}.deb
+          retention-days: 1
 
   release:
     needs: [check-updates, build]
